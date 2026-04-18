@@ -16,8 +16,18 @@ Usage
   export OPENAI_API_KEY=sk-...
   python example.py
 
-Optional: seed with transforms from llm-fuzzer by uncommenting the two lines
-at the bottom of build_controller().
+Seeding
+-------
+The default seed_strategy is "llm": the mutator proposes 8 diverse initial
+triggers from scratch (no history), which are scored and placed into the grid
+before the first evolutionary iteration. This avoids the syntax bias of the
+deterministic transforms and works for RLHF/alignment-defended targets.
+
+To switch to syntax-transform seeding (better for keyword/token-filter targets):
+  from transforms import SEED_TRANSFORMS
+  ctrl = Controller(mutator=mutator, scorer=scorer, base_prompt=BASE_PROMPT,
+                    seed_transforms=SEED_TRANSFORMS,
+                    config=RunConfig(..., seed_strategy="transforms"))
 """
 
 from __future__ import annotations
@@ -33,7 +43,6 @@ from catalog import TRANSFORM_CATALOG
 from controller import Controller, RunConfig
 from mutator import LmMutator
 from scorer import Scorer
-from transforms import SEED_TRANSFORMS
 
 # ---------------------------------------------------------------------------
 # Logging — INFO shows per-iteration progress; DEBUG shows full prompts.
@@ -132,13 +141,10 @@ def build_controller(client: AsyncOpenAI, usage: UsageAccumulator) -> Controller
         usage=usage,
     )
 
-    seeds = SEED_TRANSFORMS
-
     return Controller(
         mutator=mutator,
         scorer=scorer,
         base_prompt=BASE_PROMPT,
-        seed_transforms=seeds,
         config=RunConfig(
             max_iterations=30,
             batch_size=8,
@@ -148,6 +154,7 @@ def build_controller(client: AsyncOpenAI, usage: UsageAccumulator) -> Controller
             checkpoint_path="run_state.json",
             checkpoint_every=5,
             rng_seed=42,
+            seed_strategy="llm",   # LLM cold-start: unbiased, works for RLHF targets
         ),
     )
 

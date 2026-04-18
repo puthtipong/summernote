@@ -11,7 +11,9 @@ The name is a deliberate inversion of Wintermute.
 
 ## How it works
 
-Each iteration:
+**Phase 0 — Seed:** before the loop starts, the grid is populated. The default `seed_strategy="llm"` calls the mutator once with empty history; it proposes 8 semantically diverse initial triggers (authority, roleplay, encoding, hypothetical, etc.) which are scored and placed into the grid. Alternatively, `seed_strategy="transforms"` seeds from 33 deterministic syntax transforms; `seed_strategy="none"` scores only the base prompt.
+
+Each evolutionary iteration:
 
 1. **Propose** — `LmMutator` calls gpt-5.4 at `reasoning_effort=xhigh`, feeding it a sample of past triggers with their target responses and critic feedback. It reasons about *why* past attempts failed and proposes 8 new candidates.
 2. **Score** — each candidate is injected into the target, the oracle checks for a hard win, and the critic (gpt-5.4 at `reasoning_effort=low`) assigns a 1–10 gradient score + feedback sentence.
@@ -133,18 +135,31 @@ async def main():
 asyncio.run(main())
 ```
 
-### Seeding with built-in transforms
+### Seed strategies
 
-`transforms.py` ships 33 deterministic transforms (encoding, obfuscation, structural, unicode smuggling, control injection, judge confusion). Pass `SEED_TRANSFORMS` to populate the MAP-Elites pool for free before the first LmMutator call:
+`RunConfig(seed_strategy=...)` controls how the MAP-Elites grid is populated before the first evolutionary iteration. Three options:
+
+| Strategy | When to use |
+|----------|-------------|
+| `"llm"` **(default)** | The mutator calls `propose([])` once with empty history. It generates 8 semantically diverse triggers (authority, roleplay, hypothetical, encoding, etc.) which are scored and placed into the grid. No syntax bias — works for RLHF/alignment-defended targets. Closest to the paper's approach. |
+| `"transforms"` | Apply the `seed_transforms` list passed to `Controller`. Best when the target is known to use keyword or token-pattern filters — the 33 deterministic transforms in `transforms.py` cover encoding, obfuscation, and unicode smuggling. |
+| `"none"` | Score the base prompt only. Use this if you want to start the loop with a completely blank slate and let the mutator explore from the first real iteration. |
+
+**Using `"transforms"` seeding:**
 
 ```python
 from transforms import SEED_TRANSFORMS
 
-ctrl = Controller(mutator=mut, scorer=scr, base_prompt=BASE_PROMPT,
-                  seed_transforms=SEED_TRANSFORMS, ...)
+ctrl = Controller(
+    mutator=mut, scorer=scr, base_prompt=BASE_PROMPT,
+    seed_transforms=SEED_TRANSFORMS,
+    config=RunConfig(..., seed_strategy="transforms"),
+)
 ```
 
-The example does this by default. Each transform is scored and assigned to a grid cell; the best variants become the starting elites that the mutator refines from iteration 1 onward.
+`transforms.py` ships 33 deterministic transforms (encoding, obfuscation, structural, unicode smuggling, control injection, judge confusion). Each is scored and assigned to a grid cell; the best variants become the starting elites that the mutator refines from iteration 1 onward.
+
+> **Why LLM seeding is the default:** deterministic transforms are all syntax-level mutations. For targets defended by RLHF or values-based alignment, they all score low, filling the grid with misleading low-quality variants. The LLM cold-start explores semantic axes first and gives the mutator a more accurate gradient from the outset.
 
 ---
 

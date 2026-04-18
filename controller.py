@@ -68,6 +68,12 @@ class RunConfig:
     checkpoint_path: Optional[str] = None   # write state here; None = no checkpointing
     checkpoint_every: int = 1       # iterations between checkpoints (default 1 = every iter)
     rng_seed: Optional[int] = None
+    seed_strategy: str = "llm"
+    # "llm"        — (default) call mutator.propose([]) once for diverse LLM-generated seeds.
+    #                No syntax bias; works for RLHF/semantic defenses. Closest to the paper.
+    # "transforms" — apply the seed_transforms list from Controller.__init__.
+    #                Best when the target is known to use keyword/token filters.
+    # "none"       — score the base prompt only; skip seeding entirely.
 
     def __post_init__(self) -> None:
         if self.max_iterations < 1:
@@ -82,6 +88,11 @@ class RunConfig:
             raise ValueError("max_api_calls must be >= 10")
         if self.checkpoint_every < 1:
             raise ValueError("checkpoint_every must be >= 1")
+        if self.seed_strategy not in {"llm", "transforms", "none"}:
+            raise ValueError(
+                f"seed_strategy must be 'llm', 'transforms', or 'none'; "
+                f"got {self.seed_strategy!r}"
+            )
 
 
 @dataclass
@@ -255,6 +266,14 @@ class Controller:
         self._cfg = config or RunConfig()
         self._rng = random.Random(self._cfg.rng_seed)
 
+        # Warn if seed_transforms were provided but the strategy won't use them.
+        if self._seed_transforms and self._cfg.seed_strategy != "transforms":
+            logger.warning(
+                "seed_transforms provided (%d entries) but seed_strategy=%r — "
+                "transforms will be ignored. Set seed_strategy='transforms' to use them.",
+                len(self._seed_transforms), self._cfg.seed_strategy,
+            )
+
         # Warn if batch_size and mutator.n_candidates disagree — the pre-flight
         # budget check uses batch_size; the actual scoring uses len(proposals).
         # A mismatch doesn't break anything but can lead to confusing log output.
@@ -334,10 +353,11 @@ class Controller:
 
     # ---------- phases ------------------------------------------------------
 
-    async def _seed(self) -> None:
+    async def _seed_with_transforms(self) -> None:
+        """Seed phase: score base prompt + all deterministic transform variants in parallel."""
         t0 = time.perf_counter()
 
-        # Step 1: apply all transforms synchronously (they are instant CPU ops).
+        # Apply all transforms (they are fast, async, but effectively instant CPU ops).
         variants: list[tuple[str, str]] = [(self._base_prompt, "base")]
         for name, fn in self._seed_transforms:
             try:
@@ -364,10 +384,10 @@ class Controller:
             variants = variants[:max_variants]
 
         logger.info(
-            "=== seed phase: scoring %d variants in parallel ===", len(variants)
+            "=== seed phase (transforms): scoring %d variants in parallel ===",
+            len(variants),
         )
 
-        # Step 2: score all variants concurrently — same pattern as evolve_step.
         tasks = [
             self._score_and_absorb(text, source, iter_num=0)
             for text, source in variants
@@ -392,6 +412,84 @@ class Controller:
         logger.info(
             "seed phase complete: %d scored, %d admitted to grid in %.1fs",
             len(results) - len(failed), self._grid.size(), elapsed,
+        )
+
+    async def _seed_llm(self) -> None:
+        """
+        Seed phase: ask the mutator to propose diverse initial triggers with
+        empty history, then score them all in parallel alongside the base prompt.
+
+        This is the default strategy. Unlike the deterministic transforms, the
+        LLM starts from semantic axes (authority, roleplay, hypothetical, etc.)
+        rather than syntax mutations — so the initial gradient is useful even
+        for targets defended by RLHF or values-based alignment.
+        """
+        t0 = time.perf_counter()
+        logger.info("=== seed phase (llm): proposing diverse initial triggers ===")
+
+        # One mutator call with empty history (fires the diversity-first branch).
+        t_mut = time.perf_counter()
+        try:
+            proposals = await self._mutator.propose([])
+        except Exception as e:
+            logger.error("seed_llm: mutator.propose([]) failed: %s", e)
+            raise
+        self._api_calls += 1  # mutator call counted here, same as in _evolve_step
+
+        logger.info(
+            "seed_llm: mutator proposed %d seeds in %.1fs",
+            len(proposals), time.perf_counter() - t_mut,
+        )
+
+        # Score base prompt + all LLM proposals concurrently.
+        variants: list[tuple[str, str]] = [(self._base_prompt, "base")] + [
+            (p.trigger, f"seed-llm:{p.strategy}") for p in proposals
+        ]
+
+        needed = len(variants) * 2
+        if self._budget_left() < needed:
+            logger.warning(
+                "seed_llm: need %d api units for %d candidates but only %d left; "
+                "truncating",
+                needed, len(variants), self._budget_left(),
+            )
+            max_variants = self._budget_left() // 2
+            variants = variants[:max_variants]
+
+        tasks = [
+            self._score_and_absorb(text, source, iter_num=0)
+            for text, source in variants
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        failed = [r for r in results if isinstance(r, BaseException)]
+        for exc in failed:
+            logger.error("seed_llm: scoring task failed: %s", exc, exc_info=exc)
+        if len(failed) == len(results):
+            raise RuntimeError(
+                f"seed_llm: all {len(results)} scoring tasks failed — "
+                f"last error: {failed[-1]!r}"
+            )
+        if failed:
+            logger.warning(
+                "seed_llm: %d/%d tasks failed; %d candidates in pool",
+                len(failed), len(results), len(results) - len(failed),
+            )
+
+        elapsed = time.perf_counter() - t0
+        logger.info(
+            "seed_llm phase complete: %d scored, %d admitted to grid in %.1fs",
+            len(results) - len(failed), self._grid.size(), elapsed,
+        )
+
+    async def _seed_none(self) -> None:
+        """Seed phase: score the base prompt only; no transforms, no LLM call."""
+        t0 = time.perf_counter()
+        logger.info("=== seed phase (none): scoring base prompt only ===")
+        await self._score_and_absorb(self._base_prompt, "base", iter_num=0)
+        logger.info(
+            "seed_none phase complete: 1 scored, %d in grid in %.1fs",
+            self._grid.size(), time.perf_counter() - t0,
         )
 
     async def _evolve_step(self) -> None:
@@ -503,17 +601,23 @@ class Controller:
 
     async def run(self) -> RunResult:
         logger.info(
-            "Controller.run: prompt=%r (%d chars) seed_transforms=%d "
+            "Controller.run: prompt=%r (%d chars) seed_strategy=%s seed_transforms=%d "
             "max_iter=%d batch=%d budget=%d",
             self._base_prompt[:80], len(self._base_prompt),
-            len(self._seed_transforms), self._cfg.max_iterations,
+            self._cfg.seed_strategy, len(self._seed_transforms),
+            self._cfg.max_iterations,
             self._cfg.batch_size, self._cfg.max_api_calls,
         )
 
         self._t_run_start = time.perf_counter()
 
-        # Phase 0: seed.
-        await self._seed()
+        # Phase 0: seed — strategy dispatches to one of three methods.
+        _seed_dispatch = {
+            "llm": self._seed_llm,
+            "transforms": self._seed_with_transforms,
+            "none": self._seed_none,
+        }
+        await _seed_dispatch[self._cfg.seed_strategy]()
         # Checkpoint immediately after seeding — if the run is killed during
         # evolution, we at least have the seeded pool to resume from.
         if self._cfg.checkpoint_path:
