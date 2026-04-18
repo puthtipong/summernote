@@ -38,6 +38,7 @@ import asyncio
 import json
 import logging
 import random
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Awaitable, Callable, Optional
@@ -65,7 +66,7 @@ class RunConfig:
     stop_on_success: bool = True    # halt on first oracle win
     max_api_calls: int = 2000       # hard safety cap
     checkpoint_path: Optional[str] = None   # write state here; None = no checkpointing
-    checkpoint_every: int = 5       # iterations between checkpoints
+    checkpoint_every: int = 1       # iterations between checkpoints (default 1 = every iter)
     rng_seed: Optional[int] = None
 
     def __post_init__(self) -> None:
@@ -271,6 +272,7 @@ class Controller:
         self._successes: list[Candidate] = []
         self._api_calls = 0
         self._iter = 0
+        self._t_run_start: float = 0.0
 
     # ---------- bookkeeping -------------------------------------------------
 
@@ -333,36 +335,67 @@ class Controller:
     # ---------- phases ------------------------------------------------------
 
     async def _seed(self) -> None:
-        logger.info(
-            "=== seed phase: base_prompt + %d transforms ===",
-            len(self._seed_transforms),
-        )
-        await self._score_and_absorb(self._base_prompt, "base", iter_num=0)
-        if self._early_stop():
-            return
+        t0 = time.perf_counter()
 
+        # Step 1: apply all transforms synchronously (they are instant CPU ops).
+        variants: list[tuple[str, str]] = [(self._base_prompt, "base")]
         for name, fn in self._seed_transforms:
-            if self._budget_left() <= 2:
-                logger.warning("seed: budget exhausted; stopping seed phase early")
-                return
             try:
                 mutated = await fn(self._base_prompt)
             except Exception as e:
                 logger.warning("seed: transform %r raised %s; skipping", name, e)
                 continue
             if not isinstance(mutated, str) or not mutated:
-                logger.warning(
-                    "seed: transform %r returned non-string or empty; skipping", name
-                )
+                logger.warning("seed: transform %r returned non-string/empty; skipping", name)
                 continue
             if mutated == self._base_prompt:
                 logger.debug("seed: transform %r is a no-op; skipping", name)
                 continue
-            await self._score_and_absorb(mutated, f"seed:{name}", iter_num=0)
-            if self._early_stop():
-                return
+            variants.append((mutated, f"seed:{name}"))
+
+        needed = len(variants) * 2  # 2 api units per score
+        if self._budget_left() < needed:
+            logger.warning(
+                "seed: need %d api units for %d variants but only %d left; "
+                "truncating to fit budget",
+                needed, len(variants), self._budget_left(),
+            )
+            max_variants = self._budget_left() // 2
+            variants = variants[:max_variants]
+
+        logger.info(
+            "=== seed phase: scoring %d variants in parallel ===", len(variants)
+        )
+
+        # Step 2: score all variants concurrently — same pattern as evolve_step.
+        tasks = [
+            self._score_and_absorb(text, source, iter_num=0)
+            for text, source in variants
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        failed = [r for r in results if isinstance(r, BaseException)]
+        for exc in failed:
+            logger.error("seed: scoring task failed: %s", exc, exc_info=exc)
+        if len(failed) == len(results):
+            raise RuntimeError(
+                f"seed: all {len(results)} scoring tasks failed — "
+                f"last error: {failed[-1]!r}"
+            )
+        if failed:
+            logger.warning(
+                "seed: %d/%d tasks failed; %d variants in pool",
+                len(failed), len(results), len(results) - len(failed),
+            )
+
+        elapsed = time.perf_counter() - t0
+        logger.info(
+            "seed phase complete: %d scored, %d admitted to grid in %.1fs",
+            len(results) - len(failed), self._grid.size(), elapsed,
+        )
 
     async def _evolve_step(self) -> None:
+        t0 = time.perf_counter()
         sampled = self._sample_history(self._cfg.sample_size)
         logger.info(
             "=== iter %d | grid=%d/30 | history=%d | api=%d/%d ===",
@@ -370,10 +403,13 @@ class Controller:
             self._api_calls, self._cfg.max_api_calls,
         )
 
+        t_mut = time.perf_counter()
         proposals = await self._mutator.propose(sampled)
         self._api_calls += 1  # one mutator call
-
-        logger.info("  mutator returned %d proposals", len(proposals))
+        logger.info(
+            "  mutator returned %d proposals in %.1fs",
+            len(proposals), time.perf_counter() - t_mut,
+        )
 
         # Budget check against actual proposal count (not config.batch_size).
         per_score_cost = 2
@@ -416,6 +452,13 @@ class Controller:
                 "iter %d: %d/%d scoring tasks failed; pool updated with %d candidates",
                 self._iter, len(failed), len(results), len(results) - len(failed),
             )
+
+        logger.info(
+            "  iter %d complete in %.1fs | best_score=%.1f",
+            self._iter,
+            time.perf_counter() - t0,
+            self._grid.best().score if self._grid.best() else 0.0,
+        )
 
     # ---------- state persistence -------------------------------------------
 
@@ -467,8 +510,17 @@ class Controller:
             self._cfg.batch_size, self._cfg.max_api_calls,
         )
 
+        self._t_run_start = time.perf_counter()
+
         # Phase 0: seed.
         await self._seed()
+        # Checkpoint immediately after seeding — if the run is killed during
+        # evolution, we at least have the seeded pool to resume from.
+        if self._cfg.checkpoint_path:
+            try:
+                self.save_state(self._cfg.checkpoint_path)
+            except Exception as e:
+                logger.error("post-seed checkpoint failed: %s", e)
         if self._early_stop():
             logger.info("✓ oracle satisfied during seed phase")
             return self._finalize()
@@ -502,9 +554,11 @@ class Controller:
 
         best = self._grid.best()
         usage = getattr(self._mutator, "_usage", None) or UsageAccumulator()
+        elapsed = time.perf_counter() - self._t_run_start
         logger.info(
-            "run complete: iters=%d elites=%d successes=%d scored=%d api=%d "
+            "run complete in %.0fs: iters=%d elites=%d successes=%d scored=%d api=%d "
             "best_score=%s | %s",
+            elapsed,
             self._iter, self._grid.size(), len(self._successes),
             len(self._history), self._api_calls,
             f"{best.score:.1f}" if best else "n/a",

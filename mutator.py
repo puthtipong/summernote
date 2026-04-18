@@ -109,8 +109,17 @@ class LmMutator:
         reasoning_effort: str = "xhigh",
         n_candidates: int = 8,
         transform_catalog: Optional[list[tuple[str, str]]] = None,
+        use_catalog: bool = True,
         usage: Optional[UsageAccumulator] = None,
     ) -> None:
+        """
+        transform_catalog : explicit list of (name, description) pairs to inject
+            into the mutator system prompt. Defaults to the full TRANSFORM_CATALOG
+            from catalog.py when None and use_catalog=True.
+        use_catalog : set False to run without any catalog — the model draws
+            only on its parametric knowledge, matching the paper's setup.
+            Useful for A/B comparison against the catalog-augmented default.
+        """
         if not isinstance(goal, str) or not goal.strip():
             raise ValueError("goal must be a non-empty string")
         if not isinstance(target_context, str) or not target_context.strip():
@@ -129,10 +138,12 @@ class LmMutator:
         self._reasoning_effort = reasoning_effort
         self.n_candidates = n_candidates
         self._usage = usage
-        # Default to the full catalog; caller can pass [] to suppress.
-        self._catalog: list[tuple[str, str]] = (
-            TRANSFORM_CATALOG if transform_catalog is None else list(transform_catalog)
-        )
+        if transform_catalog is not None:
+            self._catalog: list[tuple[str, str]] = list(transform_catalog)
+        elif use_catalog:
+            self._catalog = TRANSFORM_CATALOG
+        else:
+            self._catalog = []  # paper mode: model draws on parametric knowledge only
 
     # ---------- prompt construction -----------------------------------------
     #
