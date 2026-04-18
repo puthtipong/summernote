@@ -33,6 +33,7 @@ from catalog import TRANSFORM_CATALOG
 from controller import Controller, RunConfig
 from mutator import LmMutator
 from scorer import Scorer
+from transforms import SEED_TRANSFORMS
 
 # ---------------------------------------------------------------------------
 # Logging — INFO shows per-iteration progress; DEBUG shows full prompts.
@@ -131,13 +132,7 @@ def build_controller(client: AsyncOpenAI, usage: UsageAccumulator) -> Controller
         usage=usage,
     )
 
-    # Optional: seed the pool with deterministic transforms from llm-fuzzer.
-    # Both files live in adjacent directories — adjust the path as needed.
-    # import sys; sys.path.insert(0, "../llm-fuzzer")
-    # from transforms import TRANSFORMS
-    # from controller import transforms_from_registry
-    # seeds = transforms_from_registry(TRANSFORMS, include_llm=False)
-    seeds = None
+    seeds = SEED_TRANSFORMS
 
     return Controller(
         mutator=mutator,

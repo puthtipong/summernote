@@ -133,21 +133,18 @@ async def main():
 asyncio.run(main())
 ```
 
-### Seeding with llm-fuzzer transforms
+### Seeding with built-in transforms
 
-If you have [llm-fuzzer](../llm-fuzzer) checked out, you can seed the initial pool with its full transform library (base64, leet, unicode-smuggling, etc.) for free early diversity before the first LLM call:
+`transforms.py` ships 33 deterministic transforms (encoding, obfuscation, structural, unicode smuggling, control injection, judge confusion). Pass `SEED_TRANSFORMS` to populate the MAP-Elites pool for free before the first LmMutator call:
 
 ```python
-import sys
-sys.path.insert(0, "../llm-fuzzer")
-from transforms import TRANSFORMS
-from controller import transforms_from_registry
-
-seeds = transforms_from_registry(TRANSFORMS, include_llm=False)  # deterministic only
+from transforms import SEED_TRANSFORMS
 
 ctrl = Controller(mutator=mut, scorer=scr, base_prompt=BASE_PROMPT,
-                  seed_transforms=seeds, ...)
+                  seed_transforms=SEED_TRANSFORMS, ...)
 ```
+
+The example does this by default. Each transform is scored and assigned to a grid cell; the best variants become the starting elites that the mutator refines from iteration 1 onward.
 
 ---
 
@@ -196,6 +193,7 @@ summernote/
 ├── mutator.py       — LmMutator: gpt-5.4 xhigh, structured outputs, adaptive proposal
 ├── scorer.py        — Scorer: target invocation + oracle + critic (gpt-5.4 low)
 ├── controller.py    — Controller: MAP-Elites grid, evolutionary loop, checkpointing
+├── transforms.py    — 33 deterministic seed transforms (stdlib only, no LLM)
 ├── example.py       — gpt-4o secret-extraction demo
 └── requirements.txt — openai>=1.54.0
 ```
