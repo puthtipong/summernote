@@ -427,11 +427,18 @@ class Controller:
         t0 = time.perf_counter()
         logger.info("=== seed phase (llm): proposing diverse initial triggers ===")
 
+        # Fire base-prompt scoring immediately — it doesn't depend on the mutator result,
+        # and the xhigh mutator call (~30-60s) overlaps with target+critic (~5s) for free.
+        base_task: asyncio.Task[Candidate] = asyncio.create_task(
+            self._score_and_absorb(self._base_prompt, "base", iter_num=0)
+        )
+
         # One mutator call with empty history (fires the diversity-first branch).
         t_mut = time.perf_counter()
         try:
             proposals = await self._mutator.propose([])
         except Exception as e:
+            base_task.cancel()
             logger.error("seed_llm: mutator.propose([]) failed: %s", e)
             raise
         self._api_calls += 1  # mutator call counted here, same as in _evolve_step
@@ -441,26 +448,22 @@ class Controller:
             len(proposals), time.perf_counter() - t_mut,
         )
 
-        # Score base prompt + all LLM proposals concurrently.
-        variants: list[tuple[str, str]] = [(self._base_prompt, "base")] + [
-            (p.trigger, f"seed-llm:{p.strategy}") for p in proposals
-        ]
-
-        needed = len(variants) * 2
-        if self._budget_left() < needed:
+        # Budget: base_task is already in-flight (2 units not yet counted in _api_calls).
+        # Subtract them from available headroom before sizing the proposal batch.
+        available_for_proposals = self._budget_left() - 2
+        if available_for_proposals < len(proposals) * 2:
             logger.warning(
-                "seed_llm: need %d api units for %d candidates but only %d left; "
-                "truncating",
-                needed, len(variants), self._budget_left(),
+                "seed_llm: need %d api units for %d proposals but only %d left "
+                "(2 reserved for base); truncating",
+                len(proposals) * 2, len(proposals), available_for_proposals,
             )
-            max_variants = self._budget_left() // 2
-            variants = variants[:max_variants]
+            proposals = proposals[: max(0, available_for_proposals // 2)]
 
-        tasks = [
-            self._score_and_absorb(text, source, iter_num=0)
-            for text, source in variants
+        proposal_tasks = [
+            self._score_and_absorb(p.trigger, f"seed-llm:{p.strategy}", iter_num=0)
+            for p in proposals
         ]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        results = await asyncio.gather(base_task, *proposal_tasks, return_exceptions=True)
 
         failed = [r for r in results if isinstance(r, BaseException)]
         for exc in failed:
